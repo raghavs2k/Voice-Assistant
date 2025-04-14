@@ -115,16 +115,6 @@ st.markdown("""
         width: 100%;
         height: 30px;
     }
-    .replay-button {
-        background-color: #6c5ce7;
-        color: white;
-        border: none;
-        border-radius: 4px;
-        padding: 0.25rem 0.5rem;
-        font-size: 0.75rem;
-        cursor: pointer;
-        margin-top: 0.5rem;
-    }
     /* Hide Streamlit branding */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
@@ -141,36 +131,56 @@ if 'messages' not in st.session_state:
         "time": "10:18 AM"
     }
     st.session_state.messages.append(initial_message)
+    
+    # Generate initial audio once
+    tts = gTTS(text=initial_message["content"], lang='en')
+    fp = BytesIO()
+    tts.write_to_fp(fp)
+    fp.seek(0)
+    initial_message["audio"] = fp.getvalue()
 
 # Audio functions
-def autoplay_audio(audio_data):
+def create_audio_player(audio_data, autoplay=False):
     b64 = base64.b64encode(audio_data).decode()
-    md = f"""
-        <audio autoplay class="audio-player">
+    audio_tag = f"""
+    <div class="audio-player-container">
+        <audio {'autoplay' if autoplay else ''} controls class="audio-player">
             <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
         </audio>
-        """
-    st.markdown(md, unsafe_allow_html=True)
+    </div>
+    """
+    return audio_tag
 
 def text_to_speech(text):
     try:
         tts = gTTS(text=text, lang='en')
         fp = BytesIO()
         tts.write_to_fp(fp)
+        fp.seek(0)
         return fp.getvalue()
     except Exception as e:
         st.error(f"Error generating speech: {str(e)}")
         return None
 
-def record_audio():
+def save_voice_recording():
     try:
         r = sr.Recognizer()
         with sr.Microphone() as source:
             with st.spinner("🎤 Listening... Speak now!"):
                 audio = r.listen(source)
+                
+                # Get the raw audio data
+                wav_data = BytesIO(audio.get_wav_data())
+                wav_data.seek(0)
+                raw_audio = wav_data.getvalue()
+                
+                # Transcribe to text
                 try:
                     text = r.recognize_google(audio)
-                    return text
+                    return {
+                        "text": text,
+                        "voice_data": raw_audio
+                    }
                 except sr.UnknownValueError:
                     st.error("Could not understand audio. Please try again.")
                     return None
@@ -206,28 +216,45 @@ with chat_container:
     """, unsafe_allow_html=True)
 
     # Display chat messages
-    for message in st.session_state.messages:
+    for idx, message in enumerate(st.session_state.messages):
         role = message["role"]
         content = message["content"]
         time = message.get("time", datetime.now().strftime("%I:%M %p"))
         
+        # Start message container
+        message_html = ""
+        
         if role == "assistant":
-            st.markdown(f"""
+            message_html += f"""
             <div class="chat-message-bot">
                 {content}
                 <div class="chat-message-time">{time}</div>
-            </div>
-            """, unsafe_allow_html=True)
+            """
         else:
-            st.markdown(f"""
+            message_html += f"""
             <div class="chat-message-user">
                 {content}
                 <div class="chat-message-time user-time">{time}</div>
-            </div>
-            """, unsafe_allow_html=True)
+            """
         
-        if "audio" in message:
-            autoplay_audio(message["audio"])
+        # Add audio player if available - only in the message itself
+        if role == "assistant" and "audio" in message:
+            # For the newest message, enable autoplay. For others, just controls.
+            autoplay = (idx == len(st.session_state.messages) - 1 and message.get("should_autoplay", False))
+            message_html += create_audio_player(message["audio"], autoplay=autoplay)
+            
+            # Mark as played so it doesn't autoplay again on page refresh
+            if autoplay:
+                message["should_autoplay"] = False
+                
+        elif role == "user" and "voice_data" in message:
+            message_html += create_audio_player(message["voice_data"])
+            
+        # Close message container
+        message_html += "</div>"
+        
+        # Render message
+        st.markdown(message_html, unsafe_allow_html=True)
 
 # Input area
 st.markdown("<hr style='margin-top: 2rem; margin-bottom: 1rem; opacity: 0.3;'>", unsafe_allow_html=True)
@@ -239,32 +266,48 @@ with col1:
     voice_button = st.button("🎤", key="voice_button", help="Click to speak", use_container_width=True)
 
 with col2:
-    user_input = st.text_input("Type your message...", key="user_input", label_visibility="collapsed")
+    # Clear input after sending
+    if "clear_input" not in st.session_state:
+        st.session_state.clear_input = ""
+        
+    user_input = st.text_input("Type your message...", key="user_input", 
+                              value=st.session_state.clear_input,
+                              label_visibility="collapsed")
 
 with col3:
     send_button = st.button("➤", key="send_button", help="Send message", use_container_width=True)
 
 # Handle voice input
 if voice_button:
-    user_text = record_audio()
-    if user_text and 'last_user_input' not in st.session_state:
-        st.session_state.last_user_input = user_text
-        st.session_state.messages.append({
+    voice_result = save_voice_recording()
+    if voice_result and 'last_user_input' not in st.session_state:
+        st.session_state.last_user_input = voice_result["text"]
+        
+        # Add user message with voice data
+        user_message = {
             "role": "user",
-            "content": user_text,
-            "time": datetime.now().strftime("%I:%M %p")
-        })
+            "content": f"🎤 {voice_result['text']}",
+            "time": datetime.now().strftime("%I:%M %p"),
+            "voice_data": voice_result["voice_data"]
+        }
+        st.session_state.messages.append(user_message)
         
-        bot_response = f"I received your voice message: {user_text}"
-        audio_data = text_to_speech(bot_response)
+        # Generate bot response with audio
+        bot_response = f"I received your voice message: {voice_result['text']}"
+        bot_audio = text_to_speech(bot_response)
         
-        if audio_data:
-            st.session_state.messages.append({
+        if bot_audio:
+            bot_message = {
                 "role": "assistant",
                 "content": bot_response,
-                "audio": audio_data,
-                "time": datetime.now().strftime("%I:%M %p")
-            })
+                "time": datetime.now().strftime("%I:%M %p"),
+                "audio": bot_audio,
+                "should_autoplay": True
+            }
+            st.session_state.messages.append(bot_message)
+            
+        # Clear input field for next message
+        st.session_state.clear_input = ""
         st.rerun()
 
 # Handle text input
@@ -272,22 +315,31 @@ if send_button or (user_input and user_input != st.session_state.get('prev_input
     if user_input and 'last_user_input' not in st.session_state:
         st.session_state.prev_input = user_input
         st.session_state.last_user_input = user_input
-        st.session_state.messages.append({
+        
+        # Add user message
+        user_message = {
             "role": "user",
             "content": user_input,
             "time": datetime.now().strftime("%I:%M %p")
-        })
+        }
+        st.session_state.messages.append(user_message)
         
+        # Generate bot response with audio
         bot_response = f"I received your message: {user_input}"
-        audio_data = text_to_speech(bot_response)
+        bot_audio = text_to_speech(bot_response)
         
-        if audio_data:
-            st.session_state.messages.append({
+        if bot_audio:
+            bot_message = {
                 "role": "assistant",
                 "content": bot_response,
-                "audio": audio_data,
-                "time": datetime.now().strftime("%I:%M %p")
-            })
+                "time": datetime.now().strftime("%I:%M %p"),
+                "audio": bot_audio,
+                "should_autoplay": True
+            }
+            st.session_state.messages.append(bot_message)
+        
+        # Clear input field for next message
+        st.session_state.clear_input = ""
         st.rerun()
 
 # Clear last_user_input after the rerun
